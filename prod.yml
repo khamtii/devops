@@ -1,0 +1,199 @@
+---
+- name: Provision production server
+  hosts: webservers
+  become: yes
+  vars:
+    domain_name: webservice.activ8.ng
+    email: ekwealorleo@gmail.com
+    backend_port: 5000
+
+  tasks:/
+
+  # --------------------
+  # System updates & dependencies
+  # --------------------
+  - name: Update and upgrade system
+    apt:
+      update_cache: yes
+      upgrade: dist
+
+  - name: Install basic dependencies
+    apt:
+      name:
+        - ca-certificates
+        - curl
+        - gnupg
+        - lsb-release
+        - software-properties-common
+        - ufw
+      state: present
+
+  # --------------------
+  # Docker installation (modern Ubuntu 24+)
+  # --------------------
+  - name: Create keyrings directory
+    file:
+      path: /etc/apt/keyrings
+      state: directory
+      mode: '0755'
+
+  - name: Download and add Docker GPG key
+    shell: |
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    args:
+      creates: /etc/apt/keyrings/docker.gpg
+
+  - name: Set permissions on Docker GPG key
+    file:
+      path: /etc/apt/keyrings/docker.gpg
+      mode: '0644'
+
+  - name: Add Docker repository
+    shell: |
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    args:
+      creates: /etc/apt/sources.list.d/docker.list
+
+  - name: Update apt cache after adding Docker repo
+    apt:
+      update_cache: yes
+
+  - name: Install Docker
+    apt:
+      name:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+        - docker-buildx-plugin
+        - docker-compose-plugin
+      state: present
+
+  - name: Start and enable Docker service
+    systemd:
+      name: docker
+      state: started
+      enabled: yes
+
+  - name: Add current user to docker group (optional)
+    user:
+      name: "{{ ansible_user }}"
+      groups: docker
+      append: yes
+    when: ansible_user != "root"
+
+  - name: Verify Docker installation
+    command: docker --version
+    register: docker_version
+    changed_when: false
+
+  - name: Display Docker version
+    debug:
+      msg: "Docker installed: {{ docker_version.stdout }}"
+
+  # --------------------
+  # NGINX installation
+  # --------------------
+  - name: Install NGINX
+    apt:
+      name: nginx
+      state: present
+
+  - name: Remove default nginx site
+    file:
+      path: /etc/nginx/sites-enabled/default
+      state: absent
+
+  - name: Create nginx backend config
+    copy:
+      dest: /etc/nginx/backend
+      owner: root
+      group: root
+      mode: "0644"
+      content: |
+        server {
+          server_name {{ domain_name }} www.{{ domain_name }};
+
+          client_max_body_size 1000M;
+
+          location /chatHub {
+            proxy_pass http://localhost:{{ backend_port }};
+            proxy_http_version 1.1;
+
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_connect_timeout 86400;
+          }
+
+          location = /healthz {
+            if ($request_method = HEAD) {
+                add_header Content-Length 0;
+                return 200;
+            }
+            return 200 "OK";
+          }
+
+          location / {
+            proxy_pass http://localhost:{{ backend_port }};
+            proxy_buffering off;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Port $server_port;
+            proxy_read_timeout 120s;
+            proxy_connect_timeout 120s;
+            proxy_send_timeout 120s;
+            send_timeout 120s;
+          }
+        }
+
+  - name: Enable nginx backend site
+    file:
+      src: /etc/nginx/backend
+      dest: /etc/nginx/sites-enabled/backend
+      state: link
+
+  - name: Test nginx config
+    command: nginx -t
+
+  - name: Reload nginx
+    systemd:
+      name: nginx
+      state: reloaded
+
+  # --------------------
+  # Certbot installation
+  # --------------------
+  - name: Install Certbot
+    apt:
+      name:
+        - certbot
+        - python3-certbot-nginx
+      state: present
+
+  # --------------------
+  # Firewall (UFW)
+  # --------------------
+  - name: Allow OpenSSH
+    ufw:
+      rule: allow
+      name: OpenSSH
+
+  - name: Allow HTTP
+    ufw:
+      rule: allow
+      port: 80
+
+  - name: Allow HTTPS
+    ufw:
+      rule: allow
+      port: 443
+
+  - name: Enable UFW
+    ufw:
+      state: enabled
+      policy: deny
